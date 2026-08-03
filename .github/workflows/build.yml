@@ -1,0 +1,275 @@
+name: build
+
+# 将 .upstream.lock 与三类上游源头对账，任一漂移则重建自定义多架构 Caddy 镜像。
+# 设计见 docs/adr/0001-upstream-sync-version-file-reconcile.md。
+on:
+  schedule:
+    - cron: "0 3 * * *" # 每天 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要构建的 Caddy 版本（如 2.11.4）。留空 = 最新稳定版。"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 决定构建什么、是否构建。PR 时跳过（由 build-test job 处理 PR 校验）。
+  resolve:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      caddy: ${{ steps.decide.outputs.caddy }}
+      plugin: ${{ steps.decide.outputs.plugin }}
+      base: ${{ steps.decide.outputs.base }}
+      lock_changed: ${{ steps.decide.outputs.lock_changed }}
+      image: ${{ steps.img.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 镜像引用（GHCR 要求 owner 小写）
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          owner=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner}/caddy" >> "$GITHUB_OUTPUT"
+      - name: 解析构建目标
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+
+          # 读取当前锁值
+          lock_caddy=$(grep '^caddy=' .upstream.lock | cut -d= -f2-)
+          lock_plugin=$(grep '^plugin=' .upstream.lock | cut -d= -f2-)
+          lock_base=$(grep '^base=' .upstream.lock | cut -d= -f2-)
+
+          # 取最新稳定版（/releases/latest 不含 pre-release）
+          latest_caddy=$(api https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name | sed 's/^v//')
+          latest_plugin=$(api https://api.github.com/repos/caddy-dns/tencentcloud/releases/latest | jq -r .tag_name)
+
+          case "$TRIGGER" in
+            push) target_caddy="$lock_caddy" ;;
+            workflow_dispatch)
+              if [ -n "$INPUT_VERSION" ]; then target_caddy="$INPUT_VERSION"; else target_caddy="$latest_caddy"; fi
+              ;;
+            *) target_caddy="$latest_caddy" ;;
+          esac
+          target_plugin="$latest_plugin"
+
+          # 运行时基础镜像的 manifest digest（Docker Hub 官方 library/caddy）。
+          # tag 名（caddy:<ver>-alpine）不变，但内容会随上游用打了补丁的 alpine 重建而漂移，
+          # 所以靠 digest 追踪。
+          token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/caddy:pull" | jq -r .token)
+          base_digest=$(curl -fsSI \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json" \
+            "https://registry-1.docker.io/v2/library/caddy/manifests/${target_caddy}-alpine" \
+            | awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"",$2); print $2}' | head -1)
+          [ -n "$base_digest" ] || { echo "::error::无法获取 ${target_caddy}-alpine 的基础镜像 digest"; exit 1; }
+
+          lock_changed=false
+          if [ "$target_caddy" != "$lock_caddy" ] || [ "$target_plugin" != "$lock_plugin" ] || [ "$base_digest" != "$lock_base" ]; then
+            lock_changed=true
+          fi
+
+          case "$TRIGGER" in
+            push|workflow_dispatch) should_build=true ;;
+            *) should_build=$lock_changed ;;
+          esac
+
+          {
+            echo "should_build=$should_build"
+            echo "caddy=$target_caddy"
+            echo "plugin=$target_plugin"
+            echo "base=$base_digest"
+            echo "lock_changed=$lock_changed"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::触发器=$TRIGGER 目标=caddy/$target_caddy 插件=$target_plugin 基础镜像digest/${base_digest:0:19} 需构建=$should_build 锁已变=$lock_changed"
+
+  # 在原生 runner 上按架构分别构建，按 digest 推送（暂不打 tag）。
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 时间戳
+        id: ts
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: 配置 Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: 登录 GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 按 digest 构建并推送
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            CADDY_VERSION=${{ needs.resolve.outputs.caddy }}
+          pull: true
+          outputs: type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=caddy（含 tencentcloud DNS 插件）
+            org.opencontainers.image.description=内置腾讯云 DNS 提供商的自定义 Caddy 镜像，用于 ACME DNS-01 验证。
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.caddy }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.ts.outputs.created }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - name: 导出 digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - name: 上传 digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 把各架构的 digest 合并为单个多架构 manifest 并打 tag。
+  merge:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: 下载 digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: 配置 Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: 登录 GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 创建 manifest 列表并打 tag
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          CADDY: ${{ needs.resolve.outputs.caddy }}
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          sources=""
+          for f in *; do
+            sources+="${IMAGE}@sha256:${f} "
+          done
+          docker buildx imagetools create \
+            -t "${IMAGE}:${CADDY}" \
+            -t "${IMAGE}:latest" \
+            $sources
+          docker buildx imagetools inspect "${IMAGE}:${CADDY}"
+
+  # 把新的锁值回写到仓库，使下次每日检查不再重复构建。
+  update-lock:
+    needs: [resolve, merge]
+    if: needs.resolve.outputs.lock_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 写入锁文件
+        env:
+          CADDY: ${{ needs.resolve.outputs.caddy }}
+          PLUGIN: ${{ needs.resolve.outputs.plugin }}
+          BASE: ${{ needs.resolve.outputs.base }}
+        run: |
+          {
+            printf 'caddy=%s\n' "$CADDY"
+            printf 'plugin=%s\n' "$PLUGIN"
+            printf 'base=%s\n' "$BASE"
+          } > .upstream.lock
+      - name: 提交并推送
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          CADDY: ${{ needs.resolve.outputs.caddy }}
+          PLUGIN: ${{ needs.resolve.outputs.plugin }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git add .upstream.lock
+          git commit -m "chore: 更新上游锁 (caddy=${CADDY} plugin=${PLUGIN})" || { echo "无变更可提交"; exit 0; }
+          git push origin "HEAD:${REF}"
+
+  # PR 校验：只构建不推送，不使用 secrets。单架构以提速。
+  build-test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 读取锁文件
+        id: lock
+        run: echo "caddy=$(grep '^caddy=' .upstream.lock | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+      - name: 配置 Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: 构建（不推送）
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            CADDY_VERSION=${{ steps.lock.outputs.caddy }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=amd64

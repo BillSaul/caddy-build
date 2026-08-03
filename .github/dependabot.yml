@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # 让 SHA 锁定的 GitHub Actions 保持最新（安全）。Dependabot 会开 PR 来 bump
+  # .github/workflows/build.yml 里的 commit SHA。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5

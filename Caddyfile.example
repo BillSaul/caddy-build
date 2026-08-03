@@ -1,0 +1,27 @@
+# 示例 Caddyfile - 通过 tencentcloud 提供商做 ACME DNS-01 challenge。
+#
+# 1. 复制为 `Caddyfile`，把 example.com 换成你的域名。
+# 2. 通过环境变量 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY 提供凭证
+#    （见 docker-compose.example.yml）。切勿硬编码在配置里。
+#
+# tencentcloud 插件已编译进镜像，所以 `dns tencentcloud` 开箱即用，无需额外加载模块。
+
+{
+	# email you@example.com
+	# 测试时用 Let's Encrypt staging（不占速率配额），取消下面这行的注释：
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+example.com {
+	# DNS-01 challenge：Caddy 通过 API 在腾讯云（DNSPod）上创建 TXT 记录来证明域名所有权，
+	# 因此无需开放入站 80 端口。
+	tls {
+		dns tencentcloud {
+			secret_id  {env.TENCENTCLOUD_SECRET_ID}
+			secret_key {env.TENCENTCLOUD_SECRET_KEY}
+		}
+	}
+
+	# 示例：反代到本地后端。
+	reverse_proxy localhost:8080
+}

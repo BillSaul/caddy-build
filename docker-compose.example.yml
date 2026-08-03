@@ -1,0 +1,30 @@
+# 示例：用自定义 Caddy 镜像运行腾讯云 DNS-01 challenge。
+#
+# 1. 复制 Caddyfile.example -> Caddyfile，把 example.com 换成你的域名。
+# 2. 在本文件同目录下的 .env 文件里提供凭证：
+#      TENCENTCLOUD_SECRET_ID=AKIDxxxxxxxxxxxxxxxx
+#      TENCENTCLOUD_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxx
+#    （.env 会被 compose 自动加载；记得加入 .gitignore。）
+# 3. 把下面的 <owner> 换成你的 GitHub 用户名/组织名。
+# 4. docker compose up -d
+
+services:
+  caddy:
+    image: ghcr.io/<owner>/caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 (QUIC)
+    environment:
+      TENCENTCLOUD_SECRET_ID: ${TENCENTCLOUD_SECRET_ID}
+      TENCENTCLOUD_SECRET_KEY: ${TENCENTCLOUD_SECRET_KEY}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
