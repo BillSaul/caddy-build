@@ -1,7 +1,7 @@
 version: 2
 updates:
-  # 让 SHA 锁定的 GitHub Actions 保持最新（安全）。Dependabot 会开 PR 来 bump
-  # .github/workflows/build.yml 里的 commit SHA。
+  # 让 GitHub Actions 保持最新。用浮动 tag（@vN），Dependabot 只在新大版本发布时
+  # 开 PR；groups 把所有 action 更新合并到一个 PR，避免一次冒多个。
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -10,3 +10,7 @@ updates:
       time: "04:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
